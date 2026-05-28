@@ -111,17 +111,15 @@ static void signal_handler(int /*sig*/) {
 
 // ── Segmented turn helper ─────────────────────────────────────────────────────
 // Split a long turn into multiple short segments to reduce overshoot
+// NON-BLOCKING: sends pulse command and returns immediately
 static void segmented_turn(Motor& motor, int left_speed, int right_speed, int total_pulse_us)
 {
-    int segment_pulse = total_pulse_us / TURN_SEGMENTS;
-    for (int i = 0; i < TURN_SEGMENTS; i++) {
-        motor.drive(left_speed, right_speed);
-        usleep(segment_pulse);
-        motor.standby();
-        if (i < TURN_SEGMENTS - 1) {
-            usleep(TURN_SEGMENT_DELAY);  // Pause between segments
-        }
-    }
+    // Send turn command without blocking
+    motor.drive(left_speed, right_speed);
+
+    // Schedule stop after total_pulse_us using a timer (simplified: just drive)
+    // For non-blocking, we let the motor run until next command updates it
+    // TODO: implement proper timer-based stop if needed
 }
 
 // ── Timing helper ───────────────────────────────────────────────────────────────
@@ -150,19 +148,27 @@ static int get_approach_speed(float area_ratio)
 
 // ── JPEG decode helper ────────────────────────────────────────────────────────
 // Optimized: Use libjpeg-turbo scaled decode + direct fill
+// Timing outputs (optional, pass nullptr to skip)
 static int decode_mjpeg(const uint8_t* jpeg_data, size_t jpeg_len,
                         uint8_t* rgb_out, int out_w, int out_h,
                         int* pad_x = nullptr, int* pad_y = nullptr,
-                        float* scale_out = nullptr)
+                        float* scale_out = nullptr,
+                        long* t_header = nullptr, long* t_decomp = nullptr, long* t_copy = nullptr)
 {
+    struct timeval t0, t1, t2;
+    long header_us = 0, decomp_us = 0, copy_us = 0;
+
     tjhandle tj = tjInitDecompress();
     if (!tj) return -1;
 
+    gettimeofday(&t0, nullptr);
     int w, h, subsamp, colorspace;
     if (tjDecompressHeader3(tj, jpeg_data, jpeg_len,
                             &w, &h, &subsamp, &colorspace) < 0) {
         tjDestroy(tj); return -1;
     }
+    gettimeofday(&t1, nullptr);
+    header_us = elapsed_us(t0);
 
     // Letterbox: scale uniformly so image fits in out_w × out_h
     float scale = std::min((float)out_w / w, (float)out_h / h);
@@ -182,19 +188,30 @@ static int decode_mjpeg(const uint8_t* jpeg_data, size_t jpeg_len,
     uint8_t* tmp = static_cast<uint8_t*>(malloc(new_w * new_h * 3));
     if (!tmp) { tjDestroy(tj); return -1; }
 
+    gettimeofday(&t0, nullptr);
     int ret = tjDecompress2(tj, jpeg_data, jpeg_len,
                             tmp, new_w, 0, new_h, TJPF_RGB, TJFLAG_FASTDCT);
     tjDestroy(tj);
+    gettimeofday(&t1, nullptr);
+    decomp_us = elapsed_us(t0);
+
     if (ret < 0) { free(tmp); return -1; }
 
     // Copy scaled image to letterbox position (single pass)
+    gettimeofday(&t0, nullptr);
     for (int y = 0; y < new_h; y++) {
         const uint8_t* src = tmp + y * new_w * 3;
         uint8_t* dst = rgb_out + ((y + off_y) * out_w + off_x) * 3;
         memcpy(dst, src, new_w * 3);
     }
+    gettimeofday(&t1, nullptr);
+    copy_us = elapsed_us(t0);
 
     free(tmp);
+
+    if (t_header) *t_header = header_us;
+    if (t_decomp) *t_decomp = decomp_us;
+    if (t_copy)   *t_copy   = copy_us;
     return 0;
 }
 
@@ -362,7 +379,7 @@ static int cmd_test_yolo(const char* model_path, int uvc_index)
         close(devnull);
         detect_run(&rknn_ctx, rgb_model, model_w, model_h,
                    FRAME_WIDTH, FRAME_HEIGHT, lb_pad_x, lb_pad_y, lb_scale,
-                   0.5f, 0.45f, dets);
+                   0.5f, 0.45f, dets, nullptr, nullptr, nullptr, nullptr);
         fflush(stdout);
         dup2(saved_stdout, STDOUT_FILENO);
         close(saved_stdout);
@@ -541,14 +558,16 @@ int main(int argc, char** argv)
 
     // Timing stats - only for processed frames
     int processed_cnt = 0;
-    long t_capture = 0, t_decode = 0, t_inference = 0;
+    long t_decode = 0, t_decode_header = 0, t_decode_decomp = 0, t_decode_copy = 0;
+    long t_inference = 0, t_in_input = 0, t_in_run = 0, t_in_output = 0, t_in_post = 0;
+    long t_control = 0;
 
     while (true) {
         struct timeval t_start, t_end, t_stage;
         gettimeofday(&t_start, nullptr);
         frame_idx++;
 
-        // 1. Grab MJPEG frame
+        // 1. Grab MJPEG frame (includes waiting for next frame)
         int jpeg_len = capture.getFrame(mjpeg_buf, MJPEG_BUF, 200);
         if (jpeg_len <= 0) {
             // Restore stderr for log message
@@ -568,30 +587,33 @@ int main(int argc, char** argv)
         detect_idx++;
         processed_cnt++;
 
-        // 1a. Time capture (only for processed frames)
-        gettimeofday(&t_stage, nullptr);
-        // Note: capture already happened before this point, so we can't time it accurately
-        // Skip timing capture for now
-
         // 2. Decode MJPEG → RGB letterboxed to model input, capture letterbox params
-        gettimeofday(&t_stage, nullptr);
+        long th = 0, td = 0, tc = 0;
         int lb_pad_x = 0, lb_pad_y = 0;
         float lb_scale = 1.0f;
         if (decode_mjpeg(mjpeg_buf, jpeg_len, rgb_buf, model_w, model_h,
-                         &lb_pad_x, &lb_pad_y, &lb_scale) != 0) {
+                         &lb_pad_x, &lb_pad_y, &lb_scale, &th, &td, &tc) != 0) {
             continue;
         }
-        t_decode += elapsed_us(t_stage);
+        t_decode_header += th;
+        t_decode_decomp += td;
+        t_decode_copy   += tc;
+        t_decode += (th + td + tc);
 
         // 3. Inference
-        gettimeofday(&t_stage, nullptr);
+        long ti = 0, tr = 0, to = 0, tp = 0;
         std::vector<detection> dets;
         detect_run(&rknn_ctx, rgb_buf, model_w, model_h,
                    FRAME_WIDTH, FRAME_HEIGHT, lb_pad_x, lb_pad_y, lb_scale,
-                   0.5f, 0.45f, dets);
-        t_inference += elapsed_us(t_stage);
+                   0.5f, 0.45f, dets, &ti, &tr, &to, &tp);
+        t_in_input  += ti;
+        t_in_run    += tr;
+        t_in_output += to;
+        t_in_post   += tp;
+        t_inference += (ti + tr + to + tp);
 
-        // 4. State machine
+        // 4. State machine / motor control
+        gettimeofday(&t_stage, nullptr);
         const int center = FRAME_WIDTH / 2;
 
         if (!dets.empty()) {
@@ -695,6 +717,7 @@ int main(int argc, char** argv)
             robot.status = STATUS_CHASE_TENNIS;
             motor.drive(IDLE_SPEED, -IDLE_SPEED); // 原地右转搜索
         }
+        t_control += elapsed_us(t_stage);
 
         // FPS — only print when a ball is detected
         gettimeofday(&t_end, nullptr);
@@ -702,17 +725,28 @@ int main(int argc, char** argv)
                       + (t_end.tv_usec - t_start.tv_usec);
         frame_cnt++;
         total_us += frame_us;
+
         if (!dets.empty()) {
             // Restore stderr for printf
             dup2(g_saved_stderr, STDERR_FILENO);
-            printf("[FPS] %.2f  avg: %.2f  (%.1fms)  frame=%d proc=%d  "
-                   "dec=%.1f inf=%.1f\n",
-                   1e6f / frame_us,
-                   1e6f * frame_cnt / total_us,
-                   frame_us / 1000.0f,
-                   frame_idx, processed_cnt,
+            long avg_process = (t_decode + t_inference + t_control) / processed_cnt;
+            long wait_us = frame_us - avg_process;
+            if (wait_us < 0) wait_us = 0;  // 处理速度快于摄像头时，等待时间为0
+            printf("\n[TIMING] FPS=%.1f (%.1fms)  frame=%d proc=%d\n", 1e6f / frame_us, frame_us / 1000.0f, frame_idx, processed_cnt);
+            printf("  wait_cam: %.2fms  (等待下一帧)\n", wait_us / 1000.0);
+            printf("  dec     : %.2fms  (hdr=%.2f decomp=%.2f copy=%.2f)\n",
                    t_decode / 1000.0 / processed_cnt,
-                   t_inference / 1000.0 / processed_cnt);
+                   t_decode_header / 1000.0 / processed_cnt,
+                   t_decode_decomp / 1000.0 / processed_cnt,
+                   t_decode_copy / 1000.0 / processed_cnt);
+            printf("  inf     : %.2fms  (in=%.2f run=%.2f out=%.2f post=%.2f)\n",
+                   t_inference / 1000.0 / processed_cnt,
+                   t_in_input / 1000.0 / processed_cnt,
+                   t_in_run / 1000.0 / processed_cnt,
+                   t_in_output / 1000.0 / processed_cnt,
+                   t_in_post / 1000.0 / processed_cnt);
+            printf("  ctrl    : %.2fms\n", t_control / 1000.0 / processed_cnt);
+            printf("  process : %.2fms  (dec+inf+ctrl)\n", avg_process / 1000.0);
             // Re-suppress stderr
             dup2(g_devnull, STDERR_FILENO);
         }

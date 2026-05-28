@@ -63,12 +63,14 @@ void detect_deinit(rknn_app_context_t* ctx)
 // pad_x/y  : pixel offset added during letterbox.
 // lbox_scale: scale factor (original → model).
 // Outputs bbox in original camera frame (orig_w × orig_h), cx/cy center format.
+// Timing outputs (optional, pass nullptr to skip): t_input, t_run, t_output, t_post
 int detect_run(rknn_app_context_t* ctx,
                const uint8_t* rgb_data, int model_w, int model_h,
                int orig_w, int orig_h,
                int pad_x, int pad_y, float lbox_scale,
                float conf_thresh, float iou_thresh,
-               std::vector<detection>& dets)
+               std::vector<detection>& dets,
+               long* t_input, long* t_run, long* t_output, long* t_post)
 {
     struct timeval t_start, t_stage;
     gettimeofday(&t_start, nullptr);
@@ -87,13 +89,13 @@ int detect_run(rknn_app_context_t* ctx,
 
     int ret = rknn_inputs_set(ctx->rknn_ctx, 1, inputs);
     if (ret < 0) { fprintf(stderr, "[detect] rknn_inputs_set %d\n", ret); return -1; }
-    long t_input = elapsed_us(t_stage);
+    long t_input_us = elapsed_us(t_stage);
 
     // 2. Run
     gettimeofday(&t_stage, nullptr);
     ret = rknn_run(ctx->rknn_ctx, nullptr);
     if (ret < 0) { fprintf(stderr, "[detect] rknn_run %d\n", ret); return -1; }
-    long t_run = elapsed_us(t_stage);
+    long t_run_us = elapsed_us(t_stage);
 
     // 3. Get output as FP32
     gettimeofday(&t_stage, nullptr);
@@ -103,7 +105,7 @@ int detect_run(rknn_app_context_t* ctx,
     for (int i = 0; i < n_out; i++) { outputs[i].index = i; outputs[i].want_float = 1; }
     ret = rknn_outputs_get(ctx->rknn_ctx, n_out, outputs, nullptr);
     if (ret < 0) { fprintf(stderr, "[detect] rknn_outputs_get %d\n", ret); return -1; }
-    long t_output = elapsed_us(t_stage);
+    long t_output_us = elapsed_us(t_stage);
 
     // 4. Parse [1, 5, N] — single merged output, conf already sigmoid
     gettimeofday(&t_stage, nullptr);
@@ -163,7 +165,7 @@ int detect_run(rknn_app_context_t* ctx,
                 sup[j] = true;
         }
     }
-    long t_post = elapsed_us(t_stage);
+    long t_post_us = elapsed_us(t_stage);
 
     // 7. Release
     gettimeofday(&t_stage, nullptr);
@@ -172,13 +174,19 @@ int detect_run(rknn_app_context_t* ctx,
 
     long t_total = elapsed_us(t_start);
 
+    // Export timing outputs if requested
+    if (t_input)  *t_input  = t_input_us;
+    if (t_run)    *t_run    = t_run_us;
+    if (t_output) *t_output = t_output_us;
+    if (t_post)   *t_post   = t_post_us;
+
     // Print timing breakdown - always print for debugging
     printf("[detect] total=%.1fms  in=%.1f run=%.1f out=%.1f post=%.1f rel=%.1f  cands=%d nms=%d\n",
             t_total / 1000.0f,
-            t_input / 1000.0f,
-            t_run / 1000.0f,
-            t_output / 1000.0f,
-            t_post / 1000.0f,
+            t_input_us / 1000.0f,
+            t_run_us / 1000.0f,
+            t_output_us / 1000.0f,
+            t_post_us / 1000.0f,
             t_release / 1000.0f,
             (int)cands.size(), (int)dets.size());
     fflush(stdout);
