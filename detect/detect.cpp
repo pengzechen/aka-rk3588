@@ -107,47 +107,82 @@ int detect_run(rknn_app_context_t* ctx,
     if (ret < 0) { fprintf(stderr, "[detect] rknn_outputs_get %d\n", ret); return -1; }
     long t_output_us = elapsed_us(t_stage);
 
-    // 4. Parse [1, 5, N] — single merged output, conf already sigmoid
+    // 4. Parse output
+    // 支持两种格式：
+    // - 单输出: [1, 5, N] 或 [1, N, 5] - x,y,w,h,conf 合并
+    // - 双输出: boxes=[1,4,N], scores=[1,1,N] - YOLOv8 标准格式
     gettimeofday(&t_stage, nullptr);
-    const rknn_tensor_attr& oa = ctx->output_attrs[0];
-    int d1 = oa.dims[1], d2 = oa.dims[2];
-    bool layout_5N = (d1 < d2);
-    int N = layout_5N ? d2 : d1;
-    int F = layout_5N ? d1 : d2;
-    const float* buf = (const float*)outputs[0].buf;
 
-    float max_conf = 0.0f;
-    for (int j = 0; j < N; j++) {
-        float c = layout_5N ? buf[4 * N + j] : buf[j * F + 4];
-        if (c > max_conf) max_conf = c;
-    }
-
-    // 5. Filter + undo letterbox
     std::vector<detection> cands;
-    for (int j = 0; j < N; j++) {
-        float cx, cy, w, h, conf;
-        if (layout_5N) {
-            cx = buf[0*N+j]; cy = buf[1*N+j];
-            w  = buf[2*N+j]; h  = buf[3*N+j]; conf = buf[4*N+j];
-        } else {
-            cx = buf[j*F+0]; cy = buf[j*F+1];
-            w  = buf[j*F+2]; h  = buf[j*F+3]; conf = buf[j*F+4];
+
+    if (n_out == 2) {
+        // 双输出格式: YOLOv8 标准格式
+        // outputs[0]: boxes [1, 4, N]
+        // outputs[1]: scores [1, 1, N]
+        const float* boxes = (const float*)outputs[0].buf;
+        const float* scores = (const float*)outputs[1].buf;
+
+        const rknn_tensor_attr& box_attr = ctx->output_attrs[0];
+        int N = box_attr.dims[2];  // 8400
+
+        for (int j = 0; j < N; j++) {
+            float conf = scores[j];
+            if (conf < conf_thresh) continue;
+
+            // boxes: [x, y, w, h] × N
+            float cx = boxes[0 * N + j];
+            float cy = boxes[1 * N + j];
+            float w  = boxes[2 * N + j];
+            float h  = boxes[3 * N + j];
+
+            // Undo letterbox → original camera frame
+            float rx = (cx - pad_x) / lbox_scale;
+            float ry = (cy - pad_y) / lbox_scale;
+            float rw = w / lbox_scale;
+            float rh = h / lbox_scale;
+            rx = std::max(0.0f, std::min(rx, (float)orig_w));
+            ry = std::max(0.0f, std::min(ry, (float)orig_h));
+
+            detection d;
+            d.bbox.x = rx; d.bbox.y = ry;
+            d.bbox.w = rw; d.bbox.h = rh;
+            d.score = conf; d.cls = 0; d.batch_idx = 0;
+            cands.push_back(d);
         }
-        if (conf < conf_thresh) continue;
+    } else {
+        // 单输出格式: [1, 5, N] 或 [1, N, 5]
+        const rknn_tensor_attr& oa = ctx->output_attrs[0];
+        int d1 = oa.dims[1], d2 = oa.dims[2];
+        bool layout_5N = (d1 < d2);
+        int N = layout_5N ? d2 : d1;
+        int F = layout_5N ? d1 : d2;
+        const float* buf = (const float*)outputs[0].buf;
 
-        // Undo letterbox → original camera frame
-        float rx = (cx - pad_x) / lbox_scale;
-        float ry = (cy - pad_y) / lbox_scale;
-        float rw = w / lbox_scale;
-        float rh = h / lbox_scale;
-        rx = std::max(0.0f, std::min(rx, (float)orig_w));
-        ry = std::max(0.0f, std::min(ry, (float)orig_h));
+        for (int j = 0; j < N; j++) {
+            float cx, cy, w, h, conf;
+            if (layout_5N) {
+                cx = buf[0*N+j]; cy = buf[1*N+j];
+                w  = buf[2*N+j]; h  = buf[3*N+j]; conf = buf[4*N+j];
+            } else {
+                cx = buf[j*F+0]; cy = buf[j*F+1];
+                w  = buf[j*F+2]; h  = buf[j*F+3]; conf = buf[j*F+4];
+            }
+            if (conf < conf_thresh) continue;
 
-        detection d;
-        d.bbox.x = rx; d.bbox.y = ry;
-        d.bbox.w = rw; d.bbox.h = rh;
-        d.score = conf; d.cls = 0; d.batch_idx = 0;
-        cands.push_back(d);
+            // Undo letterbox → original camera frame
+            float rx = (cx - pad_x) / lbox_scale;
+            float ry = (cy - pad_y) / lbox_scale;
+            float rw = w / lbox_scale;
+            float rh = h / lbox_scale;
+            rx = std::max(0.0f, std::min(rx, (float)orig_w));
+            ry = std::max(0.0f, std::min(ry, (float)orig_h));
+
+            detection d;
+            d.bbox.x = rx; d.bbox.y = ry;
+            d.bbox.w = rw; d.bbox.h = rh;
+            d.score = conf; d.cls = 0; d.batch_idx = 0;
+            cands.push_back(d);
+        }
     }
 
     // 6. NMS
