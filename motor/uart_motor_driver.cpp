@@ -226,8 +226,9 @@ void UartMotorDriver::cmd_brake(uint8_t motor_id)
 
 // ── MotorDriver interface ─────────────────────────────────────────────────────
 
-// Convert Motor [-100,100] to RPM
-static int16_t to_rpm(int speed, int scale)
+// Convert Motor [-100,100] to PWM value
+// ESP32 expects [-255,255] where the value is directly used as PWM duty cycle.
+static int16_t to_pwm(int speed, int scale)
 {
     // Clamp
     if (speed >  100) speed =  100;
@@ -237,8 +238,8 @@ static int16_t to_rpm(int speed, int scale)
 
 void UartMotorDriver::drive(int left_speed, int right_speed)
 {
-    cmd_set_speeds(to_rpm(left_speed, speed_scale_),
-                   to_rpm(right_speed, speed_scale_));
+    cmd_set_speeds(to_pwm(left_speed, speed_scale_),
+                   to_pwm(right_speed, speed_scale_));
 }
 
 void UartMotorDriver::brake()

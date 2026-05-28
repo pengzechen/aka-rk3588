@@ -29,14 +29,14 @@ void Motor::backward(int speed)
 
 void Motor::left(int speed)
 {
-    // Spin left: right wheel forward only
-    driver_->drive(0, speed);
+    // Spin left: right wheel forward, left wheel backward
+    driver_->drive(-speed, speed);
 }
 
 void Motor::right(int speed)
 {
-    // Spin right: left wheel forward only
-    driver_->drive(speed, 0);
+    // Spin right: left wheel forward, right wheel backward
+    driver_->drive(speed, -speed);
 }
 
 void Motor::brake()

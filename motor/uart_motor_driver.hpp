@@ -24,13 +24,12 @@
 class UartMotorDriver : public MotorDriver {
 public:
     // uart_dev:    e.g. "/dev/ttyS3"
-    // speed_scale: Motor speed unit 100 maps to this RPM value (default 300)
+    // speed_scale: Motor speed unit 100 maps to this PWM value (ESP32 uses [-255,255] directly)
+    //               Default 150 means 100%% → PWM 150 (≈60%% duty), slower and safer.
     // ppr:         Encoder pulses per revolution (default 4680 for 1:90 gearbox)
     // pwm_freq:    PWM frequency in Hz (default 20000)
-    // speed_scale: Motor speed unit 100 maps to this RPM value.
-    // Set to 250 to match measured max RPM (full speed = 250 RPM, min usable = 180 RPM).
     explicit UartMotorDriver(const std::string& uart_dev = "/dev/ttyS3",
-                             int speed_scale = 250,
+                             int speed_scale = 150,
                              uint16_t ppr = 4680,
                              uint16_t pwm_freq = 20000);
     ~UartMotorDriver() override;

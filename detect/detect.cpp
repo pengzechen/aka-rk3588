@@ -4,10 +4,19 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <sys/time.h>
 
 #include "rknn_api.h"
 #include "image_utils.h"
 #include "common.h"
+
+// ── Timing helper ───────────────────────────────────────────────────────────────
+static long elapsed_us(const struct timeval& start)
+{
+    struct timeval now;
+    gettimeofday(&now, nullptr);
+    return (now.tv_sec - start.tv_sec) * 1000000L + (now.tv_usec - start.tv_usec);
+}
 
 // ── NMS ───────────────────────────────────────────────────────────────────────
 static float iou_cx(float ax, float ay, float aw, float ah,
@@ -61,9 +70,13 @@ int detect_run(rknn_app_context_t* ctx,
                float conf_thresh, float iou_thresh,
                std::vector<detection>& dets)
 {
+    struct timeval t_start, t_stage;
+    gettimeofday(&t_start, nullptr);
+
     dets.clear();
 
     // 1. Set input
+    gettimeofday(&t_stage, nullptr);
     rknn_input inputs[1];
     memset(inputs, 0, sizeof(inputs));
     inputs[0].index  = 0;
@@ -74,20 +87,26 @@ int detect_run(rknn_app_context_t* ctx,
 
     int ret = rknn_inputs_set(ctx->rknn_ctx, 1, inputs);
     if (ret < 0) { fprintf(stderr, "[detect] rknn_inputs_set %d\n", ret); return -1; }
+    long t_input = elapsed_us(t_stage);
 
     // 2. Run
+    gettimeofday(&t_stage, nullptr);
     ret = rknn_run(ctx->rknn_ctx, nullptr);
     if (ret < 0) { fprintf(stderr, "[detect] rknn_run %d\n", ret); return -1; }
+    long t_run = elapsed_us(t_stage);
 
     // 3. Get output as FP32
+    gettimeofday(&t_stage, nullptr);
     int n_out = ctx->io_num.n_output;
     rknn_output outputs[n_out];
     memset(outputs, 0, sizeof(outputs));
     for (int i = 0; i < n_out; i++) { outputs[i].index = i; outputs[i].want_float = 1; }
     ret = rknn_outputs_get(ctx->rknn_ctx, n_out, outputs, nullptr);
     if (ret < 0) { fprintf(stderr, "[detect] rknn_outputs_get %d\n", ret); return -1; }
+    long t_output = elapsed_us(t_stage);
 
     // 4. Parse [1, 5, N] — single merged output, conf already sigmoid
+    gettimeofday(&t_stage, nullptr);
     const rknn_tensor_attr& oa = ctx->output_attrs[0];
     int d1 = oa.dims[1], d2 = oa.dims[2];
     bool layout_5N = (d1 < d2);
@@ -100,8 +119,6 @@ int detect_run(rknn_app_context_t* ctx,
         float c = layout_5N ? buf[4 * N + j] : buf[j * F + 4];
         if (c > max_conf) max_conf = c;
     }
-    fprintf(stderr, "[detect] layout=%s N=%d max_conf=%.4f thresh=%.2f\n",
-            layout_5N ? "[5,N]":"[N,5]", N, max_conf, conf_thresh);
 
     // 5. Filter + undo letterbox
     std::vector<detection> cands;
@@ -146,8 +163,25 @@ int detect_run(rknn_app_context_t* ctx,
                 sup[j] = true;
         }
     }
+    long t_post = elapsed_us(t_stage);
 
+    // 7. Release
+    gettimeofday(&t_stage, nullptr);
     rknn_outputs_release(ctx->rknn_ctx, n_out, outputs);
-    fprintf(stderr, "[detect] cands=%d nms=%d\n", (int)cands.size(), (int)dets.size());
+    long t_release = elapsed_us(t_stage);
+
+    long t_total = elapsed_us(t_start);
+
+    // Print timing breakdown - always print for debugging
+    printf("[detect] total=%.1fms  in=%.1f run=%.1f out=%.1f post=%.1f rel=%.1f  cands=%d nms=%d\n",
+            t_total / 1000.0f,
+            t_input / 1000.0f,
+            t_run / 1000.0f,
+            t_output / 1000.0f,
+            t_post / 1000.0f,
+            t_release / 1000.0f,
+            (int)cands.size(), (int)dets.size());
+    fflush(stdout);
+
     return (int)dets.size();
 }

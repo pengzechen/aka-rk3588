@@ -6,6 +6,11 @@
 //   - 差速脉冲转向 + 动态脉冲 + 太近后退
 //   - Ctrl-C 安全退出
 
+/*
+cd ../aka-rk3588/ && ./build_rk3588.sh && cd - && mv ../aka-rk3588/build/tennis  .
+
+*/
+
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
@@ -17,8 +22,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <termios.h>
-#include <sys/select.h>
 #include <algorithm>
 #include <vector>
 
@@ -33,6 +36,11 @@
 // ── Build-time tunables ───────────────────────────────────────────────────────
 #define ENABLE_DRAW_BBOX  0
 #define ENABLE_SAVE_IMAGE 0
+#define SKIP_FRAMES       0  // Process every Nth frame (0=process all)
+
+// ── Segmented turn parameters ─────────────────────────────────────────────────
+static const int TURN_SEGMENTS       = 3;  // Number of segments per turn
+static const int TURN_SEGMENT_DELAY  = 25 * 1000;  // 25ms pause between segments
 
 // ── Camera / model parameters ─────────────────────────────────────────────────
 // Camera capture resolution: use a standard MJPEG mode most UVC cameras support.
@@ -46,18 +54,19 @@ static const int MODEL_H      = 640;
 static const float GRAB_AREA            = 0.40f;
 static const float GRAB_AREA_MAX        = 0.55f;
 static const int   CENTER_MARGIN        = 35;
-static const float K_TURN_PULSE         = 5000.0f;
-static const int   TURN_PULSE_MAX       = 500 * 1000;
-static const int   TURN_PULSE_MIN       = 75  * 1000;
-// Speed unit is Motor [-100,100] → RPM via speed_scale=250.
-// Measured: min usable ≈ 180 RPM (unit=72), full speed = 250 RPM (unit=100).
-static const int   CHASE_SPEED          = 100; // 250 RPM - full forward
-static const int   TURN_SPEED           = 80;  // 200 RPM - turn in place
-static const int   IDLE_SPEED           = 75;  // 188 RPM - search spin (just above min)
+static const float K_TURN_PULSE         = 1000.0f;  // Further reduced for close-range
+static const int   TURN_PULSE_MAX       = 100 * 1000;  // Max 100ms for close targets
+static const int   TURN_PULSE_MIN       = 20  * 1000;  // Min 20ms
+// Speed unit is Motor [-100,100] → PWM via speed_scale=150.
+// ESP32 PWM range is [-255,255], so 100%% → PWM 150 (≈60%% duty cycle).
+// Minimum usable speed is 16 (PWM 24).
+static const int   CHASE_SPEED          = 60;  // Forward speed (PWM 90) - reduced by 40%
+static const int   TURN_SPEED           = 30;  // Turn in place (PWM 45)
+static const int   IDLE_SPEED           = 17;  // Search spin (PWM 25.5)
 static const int   GRAB_CONFIRM_THRESHOLD = 5;
-static const int   BACKWARD_SPEED       = 75;  // 188 RPM - back up
+static const int   BACKWARD_SPEED       = 40;  // Back up (PWM 60)
 static const int   BACKWARD_PULSE_US    = 200 * 1000;
-static const int   GRAB_LEFT_TURN_SPEED = 75;  // 188 RPM - alignment turns
+static const int   GRAB_LEFT_TURN_SPEED = 25;  // Alignment turns (PWM 38)
 static const int   GRAB_LEFT_TURN_US    = 150 * 1000;
 static const int   GRAB_LEFT_TURN_COUNT = 4;
 
@@ -82,11 +91,17 @@ struct RobotState {
 static Motor*      g_motor   = nullptr;
 static UvcCapture* g_capture = nullptr;
 static rknn_app_context_t* g_rknn_ctx = nullptr;
+static int         g_saved_stderr = -1;
+static int         g_devnull = -1;
 
 static void cleanup_and_exit() {
     if (g_motor)   g_motor->standby();
     if (g_capture) g_capture->close();
     if (g_rknn_ctx) detect_deinit(g_rknn_ctx);
+    // Restore stderr
+    if (g_saved_stderr >= 0 && g_devnull >= 0) {
+        dup2(g_saved_stderr, STDERR_FILENO);
+    }
 }
 
 static void signal_handler(int /*sig*/) {
@@ -94,10 +109,47 @@ static void signal_handler(int /*sig*/) {
     exit(0);
 }
 
+// ── Segmented turn helper ─────────────────────────────────────────────────────
+// Split a long turn into multiple short segments to reduce overshoot
+static void segmented_turn(Motor& motor, int left_speed, int right_speed, int total_pulse_us)
+{
+    int segment_pulse = total_pulse_us / TURN_SEGMENTS;
+    for (int i = 0; i < TURN_SEGMENTS; i++) {
+        motor.drive(left_speed, right_speed);
+        usleep(segment_pulse);
+        motor.standby();
+        if (i < TURN_SEGMENTS - 1) {
+            usleep(TURN_SEGMENT_DELAY);  // Pause between segments
+        }
+    }
+}
+
+// ── Timing helper ───────────────────────────────────────────────────────────────
+static long elapsed_us(const struct timeval& start)
+{
+    struct timeval now;
+    gettimeofday(&now, nullptr);
+    return (now.tv_sec - start.tv_sec) * 1000000L + (now.tv_usec - start.tv_usec);
+}
+
+// ── Dynamic speed based on distance ────────────────────────────────────────────
+// Calculate forward speed based on ball area ratio (closer = slower)
+// area_ratio: 0.01 (far) to 0.55 (very close)
+// Returns speed in range [MIN_APPROACH_SPEED, CHASE_SPEED]
+static const int MIN_APPROACH_SPEED = 20;  // Minimum speed when very close (PWM 30)
+static int get_approach_speed(float area_ratio)
+{
+    // Linear interpolation: speed decreases as area_ratio increases
+    // At area_ratio = 0.01: return CHASE_SPEED
+    // At area_ratio = GRAB_AREA (0.40): return MIN_APPROACH_SPEED
+    float t = (area_ratio - 0.01f) / (GRAB_AREA - 0.01f);  // 0 to 1
+    t = std::max(0.0f, std::min(1.0f, t));
+    int speed = CHASE_SPEED - t * (CHASE_SPEED - MIN_APPROACH_SPEED);
+    return std::max(MIN_APPROACH_SPEED, speed);
+}
+
 // ── JPEG decode helper ────────────────────────────────────────────────────────
-// Decode MJPEG → native RGB, then letterbox-pad to (out_w × out_h).
-// pad_x, pad_y: pixels added on each side; scale: native→model scale factor.
-// Returns 0 on success.
+// Optimized: Use libjpeg-turbo scaled decode + direct fill
 static int decode_mjpeg(const uint8_t* jpeg_data, size_t jpeg_len,
                         uint8_t* rgb_out, int out_w, int out_h,
                         int* pad_x = nullptr, int* pad_y = nullptr,
@@ -112,14 +164,7 @@ static int decode_mjpeg(const uint8_t* jpeg_data, size_t jpeg_len,
         tjDestroy(tj); return -1;
     }
 
-    uint8_t* tmp = static_cast<uint8_t*>(malloc(w * h * 3));
-    if (!tmp) { tjDestroy(tj); return -1; }
-    int ret = tjDecompress2(tj, jpeg_data, jpeg_len,
-                            tmp, w, 0, h, TJPF_RGB, TJFLAG_FASTDCT);
-    tjDestroy(tj);
-    if (ret < 0) { free(tmp); return -1; }
-
-    // Letterbox: scale uniformly so image fits in out_w × out_h, pad with 114
+    // Letterbox: scale uniformly so image fits in out_w × out_h
     float scale = std::min((float)out_w / w, (float)out_h / h);
     int new_w = (int)(w * scale + 0.5f);
     int new_h = (int)(h * scale + 0.5f);
@@ -132,17 +177,21 @@ static int decode_mjpeg(const uint8_t* jpeg_data, size_t jpeg_len,
     // Fill background with 114
     memset(rgb_out, 114, out_w * out_h * 3);
 
-    // Nearest-neighbour scale into the padded region
+    // Use libjpeg-turbo scaled decode (fast) + direct fill to letterbox position
+    // Decode to temporary scaled buffer
+    uint8_t* tmp = static_cast<uint8_t*>(malloc(new_w * new_h * 3));
+    if (!tmp) { tjDestroy(tj); return -1; }
+
+    int ret = tjDecompress2(tj, jpeg_data, jpeg_len,
+                            tmp, new_w, 0, new_h, TJPF_RGB, TJFLAG_FASTDCT);
+    tjDestroy(tj);
+    if (ret < 0) { free(tmp); return -1; }
+
+    // Copy scaled image to letterbox position (single pass)
     for (int y = 0; y < new_h; y++) {
-        int src_y = (int)(y / scale);
-        if (src_y >= h) src_y = h - 1;
-        for (int x = 0; x < new_w; x++) {
-            int src_x = (int)(x / scale);
-            if (src_x >= w) src_x = w - 1;
-            const uint8_t* src = tmp + (src_y * w + src_x) * 3;
-            uint8_t*       dst = rgb_out + ((y + off_y) * out_w + (x + off_x)) * 3;
-            dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
-        }
+        const uint8_t* src = tmp + y * new_w * 3;
+        uint8_t* dst = rgb_out + ((y + off_y) * out_w + off_x) * 3;
+        memcpy(dst, src, new_w * 3);
     }
 
     free(tmp);
@@ -339,240 +388,64 @@ static int cmd_test_yolo(const char* model_path, int uvc_index)
     return 0;
 }
 
-// ── test-motor: exercise the ESP32 UART motor controller ─────────────────────
-
-// Raw UART helpers (mirrors test_uart.py logic exactly)
-namespace raw_uart {
-
-static uint8_t calc_chk(uint8_t cmd, uint8_t len, const uint8_t* p) {
-    uint8_t c = cmd ^ len;
-    for (uint8_t i = 0; i < len; i++) c ^= p[i];
-    return c;
-}
-
-static bool open_port(const char* dev, int& fd) {
-    fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) { perror("open"); return false; }
-    struct termios tty{};
-    tcgetattr(fd, &tty);
-    cfsetospeed(&tty, B115200); cfsetispeed(&tty, B115200);
-    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8 | CLOCAL | CREAD;
-    tty.c_cflag &= ~(PARENB|PARODD|CSTOPB|CRTSCTS);
-    tty.c_iflag &= ~(IXON|IXOFF|IXANY|IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);
-    tty.c_oflag &= ~OPOST;
-    tty.c_lflag = 0;
-    tty.c_cc[VMIN] = 0; tty.c_cc[VTIME] = 0;
-    tcflush(fd, TCIOFLUSH);
-    tcsetattr(fd, TCSANOW, &tty);
-    return true;
-}
-
-static bool read_byte(int fd, uint8_t& b, int timeout_ms = 200) {
-    fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
-    struct timeval tv = { timeout_ms/1000, (timeout_ms%1000)*1000 };
-    if (select(fd+1, &fds, nullptr, nullptr, &tv) <= 0) return false;
-    return read(fd, &b, 1) == 1;
-}
-
-static void send_frame(int fd, uint8_t cmd, const uint8_t* payload = nullptr, uint8_t len = 0) {
-    uint8_t buf[64];
-    buf[0]=0xAA; buf[1]=0x55; buf[2]=cmd; buf[3]=len;
-    if (len && payload) memcpy(&buf[4], payload, len);
-    buf[4+len] = calc_chk(cmd, len, payload ? payload : (const uint8_t*)"");
-    ssize_t w = write(fd, buf, 5+len); (void)w;
-}
-
-// Returns true and fills cmd_out/payload_out/len_out on success
-static bool recv_frame(int fd, uint8_t& cmd_out, uint8_t* payload_out, uint8_t& len_out,
-                        int timeout_ms = 500) {
-    // Wait for 0xAA 0x55
-    int deadline = timeout_ms;
-    while (deadline > 0) {
-        uint8_t b;
-        if (!read_byte(fd, b, 20)) { deadline -= 20; continue; }
-        if (b != 0xAA) continue;
-        if (!read_byte(fd, b, 50)) return false;
-        if (b == 0x55) break;
-    }
-    if (deadline <= 0) return false;
-    uint8_t cmd, len;
-    if (!read_byte(fd, cmd, 100)) return false;
-    if (!read_byte(fd, len, 100)) return false;
-    uint8_t payload[32]{};
-    for (uint8_t i = 0; i < len && i < 32; i++)
-        if (!read_byte(fd, payload[i], 100)) return false;
-    uint8_t chk;
-    if (!read_byte(fd, chk, 100)) return false;
-    if (calc_chk(cmd, len, payload) != chk) {
-        printf("  [WARN] checksum mismatch\n"); return false;
-    }
-    cmd_out = cmd; len_out = len;
-    if (payload_out) memcpy(payload_out, payload, len);
-    return true;
-}
-
-static const char* resp_name(uint8_t cmd) {
-    switch(cmd) {
-        case 0x80: return "ACK";
-        case 0x81: return "NACK";
-        case 0x90: return "RPM_DATA";
-        case 0x91: return "STATUS";
-        default:   return "???";
-    }
-}
-static const char* err_name(uint8_t e) {
-    switch(e) {
-        case 0x01: return "WRONG_STATE";
-        case 0x02: return "BAD_CHECKSUM";
-        case 0x03: return "INVALID_PARAM";
-        case 0x04: return "UNKNOWN_CMD";
-        default:   return "?";
-    }
-}
-static const char* state_name(uint8_t s) {
-    switch(s) {
-        case 0: return "UNINIT"; case 1: return "IDLE";
-        case 2: return "READY";  case 3: return "RUNNING";
-        case 4: return "ERROR";  default: return "?";
-    }
-}
-
-// Send a command, print response. Returns true if ACK.
-static bool do_cmd(int fd, const char* label, uint8_t cmd,
-                   const uint8_t* payload = nullptr, uint8_t len = 0) {
-    send_frame(fd, cmd, payload, len);
-    uint8_t rcmd=0, rlen=0, rbuf[32]{};
-    bool got = recv_frame(fd, rcmd, rbuf, rlen);
-    if (!got) {
-        printf("  [FAIL] %-30s → NO RESPONSE\n", label);
-        return false;
-    }
-    if (rcmd == 0x80) { // ACK
-        printf("  [ACK ] %-30s → ACK(cmd=%02x)\n", label, rbuf[0]);
-        return true;
-    } else if (rcmd == 0x81) { // NACK
-        uint8_t err = rlen >= 2 ? rbuf[1] : 0;
-        printf("  [NACK] %-30s → NACK err=%s(%02x)\n", label, err_name(err), err);
-        return false;
-    } else {
-        printf("  [????] %-30s → rsp=%02x(%s) len=%d\n", label, rcmd, resp_name(rcmd), rlen);
-        return false;
-    }
-}
-
-static void get_status(int fd) {
-    send_frame(fd, 0x21); // CMD_GET_STATUS
-    uint8_t rcmd=0, rlen=0, rbuf[32]{};
-    if (!recv_frame(fd, rcmd, rbuf, rlen) || rcmd != 0x91 || rlen < 5) {
-        printf("  [WARN] GET_STATUS: no valid response (rcmd=%02x rlen=%d)\n", rcmd, rlen);
-        return;
-    }
-    int16_t rpm1 = (int16_t)((rbuf[1]<<8)|rbuf[2]);
-    int16_t rpm2 = (int16_t)((rbuf[3]<<8)|rbuf[4]);
-    printf("  [STAT] state=%-8s  M1=%d RPM  M2=%d RPM\n",
-           state_name(rbuf[0]), rpm1, rpm2);
-}
-
-} // namespace raw_uart
-
+// ── test-motor: test the Motor abstraction layer ─────────────────────────────
 static int cmd_test_motor(const char* uart_dev, int argc, char** argv)
 {
-    // Parse optional m1=<speed> m2=<speed> from remaining argv
+    // Parse optional speed from remaining argv
     // argv here is the full argv; scan from index 3 onward
-    bool manual = false;
-    int  m1_speed = 0, m2_speed = 0;
+    int  speed = 0;
     for (int i = 3; i < argc; i++) {
-        if (strncmp(argv[i], "m1=", 3) == 0) { m1_speed = atoi(argv[i] + 3); manual = true; }
-        if (strncmp(argv[i], "m2=", 3) == 0) { m2_speed = atoi(argv[i] + 3); manual = true; }
+        if (strncmp(argv[i], "speed=", 6) == 0) { speed = atoi(argv[i] + 6); }
     }
 
-    printf("=== test-motor RAW: %s ===\n", uart_dev);
+    printf("=== test-motor: %s ===\n", uart_dev);
+    if (speed > 0) {
+        printf("Manual mode: speed=%d\n", speed);
+    }
 
-    int fd;
-    if (!raw_uart::open_port(uart_dev, fd)) return 1;
-    usleep(100000);
-    tcflush(fd, TCIOFLUSH);
+    Motor motor(MotorDriverType::UART, uart_dev);
 
-    // Always: INIT → CONFIG
-    printf("\n[INIT]\n");
-    raw_uart::do_cmd(fd, "INIT",               0x01);
-    printf("\n[CONFIG]\n");
-    uint8_t cfg[4] = {0x12,0x48, 0x4E,0x20}; // PPR=4680, FREQ=20000
-    raw_uart::do_cmd(fd, "CONFIG(4680,20000)", 0x02, cfg, 4);
-    raw_uart::get_status(fd);
-
-    if (manual) {
-        // ── Manual mode: set requested speeds and hold ────────────────────────
-        auto make_spd = [](int16_t spd, uint8_t id, uint8_t out[3]) {
-            out[0] = id;
-            out[1] = (uint8_t)((uint16_t)spd >> 8);
-            out[2] = (uint8_t)((uint16_t)spd & 0xFF);
-        };
-        printf("\n[MANUAL] M1=%d  M2=%d\n", m1_speed, m2_speed);
-        uint8_t p1[3], p2[3];
-        make_spd((int16_t)m1_speed, 0, p1);
-        make_spd((int16_t)m2_speed, 1, p2);
-        char lbl1[32], lbl2[32];
-        snprintf(lbl1, sizeof(lbl1), "SET_SPEED M1=%d", m1_speed);
-        snprintf(lbl2, sizeof(lbl2), "SET_SPEED M2=%d", m2_speed);
-        raw_uart::do_cmd(fd, lbl1, 0x10, p1, 3);
-        raw_uart::do_cmd(fd, lbl2, 0x10, p2, 3);
-        raw_uart::get_status(fd);
-
-        printf("  (running for 5s, then STOP)\n");
+    if (speed > 0) {
+        // Manual mode: hold speed for 5s then stop
+        printf("Forward %d%% for 5s...\n", speed);
+        motor.forward(speed);
         sleep(5);
-
-        raw_uart::do_cmd(fd, "STOP M1", 0x11, (const uint8_t*)"\x00", 1);
-        raw_uart::do_cmd(fd, "STOP M2", 0x11, (const uint8_t*)"\x01", 1);
-        raw_uart::get_status(fd);
-
+        motor.standby();
     } else {
-        // ── Auto sequence ─────────────────────────────────────────────────────
-        printf("\n[3] SET_SPEED forward (200, 200)\n");
-        uint8_t spd_fwd_m1[3] = {0x00, 0x00,0xC8};
-        uint8_t spd_fwd_m2[3] = {0x01, 0x00,0xC8};
-        raw_uart::do_cmd(fd, "SET_SPEED M1=200",  0x10, spd_fwd_m1, 3);
-        raw_uart::do_cmd(fd, "SET_SPEED M2=200",  0x10, spd_fwd_m2, 3);
-        raw_uart::get_status(fd);
+        // Auto sequence
+        printf("\n[1] Forward 50%% for 2s\n");
+        motor.forward(50);
         sleep(2);
 
-        printf("\n[4] STOP both\n");
-        raw_uart::do_cmd(fd, "STOP M1", 0x11, (const uint8_t*)"\x00", 1);
-        raw_uart::do_cmd(fd, "STOP M2", 0x11, (const uint8_t*)"\x01", 1);
-        raw_uart::get_status(fd);
+        printf("\n[2] Stop\n");
+        motor.standby();
         sleep(1);
 
-        printf("\n[5] SET_SPEED backward (-200, -200)\n");
-        uint8_t spd_bwd_m1[3] = {0x00, 0xFF,0x38};
-        uint8_t spd_bwd_m2[3] = {0x01, 0xFF,0x38};
-        raw_uart::do_cmd(fd, "SET_SPEED M1=-200", 0x10, spd_bwd_m1, 3);
-        raw_uart::do_cmd(fd, "SET_SPEED M2=-200", 0x10, spd_bwd_m2, 3);
-        raw_uart::get_status(fd);
+        printf("\n[3] Backward 50%% for 2s\n");
+        motor.backward(50);
         sleep(2);
 
-        printf("\n[6] STOP both\n");
-        raw_uart::do_cmd(fd, "STOP M1", 0x11, (const uint8_t*)"\x00", 1);
-        raw_uart::do_cmd(fd, "STOP M2", 0x11, (const uint8_t*)"\x01", 1);
-        raw_uart::get_status(fd);
+        printf("\n[4] Stop\n");
+        motor.standby();
         sleep(1);
 
-        printf("\n[7] Spin left (-180, +180)\n");
-        uint8_t spd_l_m1[3] = {0x00, 0xFF,0x4A};
-        uint8_t spd_l_m2[3] = {0x01, 0x00,0xB4};
-        raw_uart::do_cmd(fd, "SET_SPEED M1=-180", 0x10, spd_l_m1, 3);
-        raw_uart::do_cmd(fd, "SET_SPEED M2=+180", 0x10, spd_l_m2, 3);
-        raw_uart::get_status(fd);
+        printf("\n[5] Turn left 50%% for 2s\n");
+        motor.left(50);
         sleep(2);
 
-        printf("\n[8] STOP → RESET\n");
-        raw_uart::do_cmd(fd, "STOP M1", 0x11, (const uint8_t*)"\x00", 1);
-        raw_uart::do_cmd(fd, "STOP M2", 0x11, (const uint8_t*)"\x01", 1);
-        usleep(300000);
-        raw_uart::do_cmd(fd, "RESET", 0xFF);
+        printf("\n[6] Stop\n");
+        motor.standby();
+        sleep(1);
+
+        printf("\n[7] Turn right 50%% for 2s\n");
+        motor.right(50);
+        sleep(2);
+
+        printf("\n[8] Stop\n");
+        motor.standby();
     }
 
     printf("\n=== test-motor DONE ===\n");
-    close(fd);
     return 0;
 }
 
@@ -586,11 +459,10 @@ static void usage(const char* prog) {
     LOGI("");
     LOGI("  %s test-uvc [uvc_device_index]          -- capture one frame → capture.jpg", prog);
     LOGI("  %s test-yolo <model.rknn> [uvc_index]   -- detect one frame  → result.jpg", prog);
-    LOGI("  %s test-motor [uart_dev] [m1=<rpm>] [m2=<rpm>]", prog);
-    LOGI("      -- no m1/m2: run auto sequence");
-    LOGI("      -- with m1/m2: hold that speed for 5s then stop");
-    LOGI("      -- example: %s test-motor /dev/ttyUSB0 m1=200 m2=200", prog);
-    LOGI("      -- example: %s test-motor /dev/ttyUSB0 m1=-150 m2=150", prog);
+    LOGI("  %s test-motor [uart_dev] [speed=N]", prog);
+    LOGI("      -- no speed: run auto sequence");
+    LOGI("      -- with speed: hold that speed (%%) for 5s then stop");
+    LOGI("      -- example: %s test-motor /dev/ttyUSB0 speed=50", prog);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -648,6 +520,11 @@ int main(int argc, char** argv)
     int model_h = rknn_ctx.model_height;
     LOGI("Model input %dx%d", model_w, model_h);
 
+    // Suppress detect.cpp stderr spam (one-time redirect)
+    g_devnull = open("/dev/null", O_WRONLY);
+    g_saved_stderr = dup(STDERR_FILENO);
+    dup2(g_devnull, STDERR_FILENO);
+
     // Buffers
     const size_t MJPEG_BUF = 1024 * 1024; // 1 MB should be enough for 640×480 MJPEG
     uint8_t* mjpeg_buf = static_cast<uint8_t*>(malloc(MJPEG_BUF));
@@ -658,45 +535,61 @@ int main(int argc, char** argv)
     RobotState robot;
 
     int frame_idx   = 0;
+    int detect_idx  = 0;
     long total_us   = 0;
     int  frame_cnt  = 0;
 
+    // Timing stats - only for processed frames
+    int processed_cnt = 0;
+    long t_capture = 0, t_decode = 0, t_inference = 0;
+
     while (true) {
-        struct timeval t_start, t_end;
+        struct timeval t_start, t_end, t_stage;
         gettimeofday(&t_start, nullptr);
         frame_idx++;
 
         // 1. Grab MJPEG frame
         int jpeg_len = capture.getFrame(mjpeg_buf, MJPEG_BUF, 200);
         if (jpeg_len <= 0) {
+            // Restore stderr for log message
+            dup2(g_saved_stderr, STDERR_FILENO);
             LOGW("[Frame %d] No frame (timeout)", frame_idx);
+            dup2(g_devnull, STDERR_FILENO);
             usleep(10000);
             continue;
         }
 
+        // Frame skip: only process every Nth frame
+#if SKIP_FRAMES > 0
+        if ((frame_idx % (SKIP_FRAMES + 1)) != 0) {
+            continue;
+        }
+#endif
+        detect_idx++;
+        processed_cnt++;
+
+        // 1a. Time capture (only for processed frames)
+        gettimeofday(&t_stage, nullptr);
+        // Note: capture already happened before this point, so we can't time it accurately
+        // Skip timing capture for now
+
         // 2. Decode MJPEG → RGB letterboxed to model input, capture letterbox params
+        gettimeofday(&t_stage, nullptr);
         int lb_pad_x = 0, lb_pad_y = 0;
         float lb_scale = 1.0f;
         if (decode_mjpeg(mjpeg_buf, jpeg_len, rgb_buf, model_w, model_h,
                          &lb_pad_x, &lb_pad_y, &lb_scale) != 0) {
-            LOGW("[Frame %d] JPEG decode failed", frame_idx);
             continue;
         }
+        t_decode += elapsed_us(t_stage);
 
-        // 3. Inference (suppress library stdout chatter)
+        // 3. Inference
+        gettimeofday(&t_stage, nullptr);
         std::vector<detection> dets;
-        {
-            int saved_stdout = dup(STDOUT_FILENO);
-            int devnull = open("/dev/null", O_WRONLY);
-            dup2(devnull, STDOUT_FILENO);
-            close(devnull);
-            detect_run(&rknn_ctx, rgb_buf, model_w, model_h,
-                       FRAME_WIDTH, FRAME_HEIGHT, lb_pad_x, lb_pad_y, lb_scale,
-                       0.5f, 0.45f, dets);
-            fflush(stdout);
-            dup2(saved_stdout, STDOUT_FILENO);
-            close(saved_stdout);
-        }
+        detect_run(&rknn_ctx, rgb_buf, model_w, model_h,
+                   FRAME_WIDTH, FRAME_HEIGHT, lb_pad_x, lb_pad_y, lb_scale,
+                   0.5f, 0.45f, dets);
+        t_inference += elapsed_us(t_stage);
 
         // 4. State machine
         const int center = FRAME_WIDTH / 2;
@@ -771,11 +664,9 @@ int main(int argc, char** argv)
                 LOGD("[ALIGN] Aligning cx=%d offset=%d pulse=%dms",
                      ball_cx, offset, pulse_us / 1000);
                 if (offset < 0)
-                    motor.drive(-TURN_SPEED, TURN_SPEED);
+                    segmented_turn(motor, -TURN_SPEED, TURN_SPEED, pulse_us);
                 else
-                    motor.drive(TURN_SPEED, -TURN_SPEED);
-                usleep(pulse_us);
-                motor.standby();
+                    segmented_turn(motor, TURN_SPEED, -TURN_SPEED, pulse_us);
 
             } else {
                 // Chase
@@ -785,16 +676,16 @@ int main(int argc, char** argv)
                 if (!centered) {
                     if (offset < 0) {
                         LOGD("[MOTOR] TURN LEFT cx=%d pulse=%dms", ball_cx, pulse_us / 1000);
-                        motor.drive(-TURN_SPEED, TURN_SPEED);
+                        segmented_turn(motor, -TURN_SPEED, TURN_SPEED, pulse_us);
                     } else {
                         LOGD("[MOTOR] TURN RIGHT cx=%d pulse=%dms", ball_cx, pulse_us / 1000);
-                        motor.drive(TURN_SPEED, -TURN_SPEED);
+                        segmented_turn(motor, TURN_SPEED, -TURN_SPEED, pulse_us);
                     }
-                    usleep(pulse_us);
-                    motor.standby();
                 } else {
-                    LOGD("[MOTOR] FORWARD area=%.3f", area_ratio);
-                    motor.forward(CHASE_SPEED);
+                    // Dynamic speed: slower when closer
+                    int approach_speed = get_approach_speed(area_ratio);
+                    LOGD("[MOTOR] FORWARD area=%.3f speed=%d", area_ratio, approach_speed);
+                    motor.forward(approach_speed);
                 }
             }
 
@@ -812,10 +703,18 @@ int main(int argc, char** argv)
         frame_cnt++;
         total_us += frame_us;
         if (!dets.empty()) {
-            printf("[FPS] %.2f  avg: %.2f  (%.1fms)\n",
+            // Restore stderr for printf
+            dup2(g_saved_stderr, STDERR_FILENO);
+            printf("[FPS] %.2f  avg: %.2f  (%.1fms)  frame=%d proc=%d  "
+                   "dec=%.1f inf=%.1f\n",
                    1e6f / frame_us,
                    1e6f * frame_cnt / total_us,
-                   frame_us / 1000.0f);
+                   frame_us / 1000.0f,
+                   frame_idx, processed_cnt,
+                   t_decode / 1000.0 / processed_cnt,
+                   t_inference / 1000.0 / processed_cnt);
+            // Re-suppress stderr
+            dup2(g_devnull, STDERR_FILENO);
         }
     }
 
