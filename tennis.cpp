@@ -170,6 +170,7 @@ static void usage(const char* prog) {
     LOGI("  %s test-yolo  <model.rknn> [uvc_index]  -- detect one frame  -> result.jpg", prog);
     LOGI("  %s test-motor [uart_dev] [speed=N]       -- motor test", prog);
     LOGI("  %s test-arm   [uart_dev] <cmd|a0 a1 a2>  -- arm servo test (default /dev/ttyUSB1)", prog);
+    LOGI("  %s test-bucket [uvc_index]               -- red bucket detect -> bucket.jpg", prog);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -193,6 +194,10 @@ int main(int argc, char** argv)
     if (strcmp(argv[1], "test-arm") == 0) {
         const char* dev = (argc >= 3) ? argv[2] : "/dev/ttyUSB1";
         return cmd_test_arm(dev, argc, argv);
+    }
+    if (strcmp(argv[1], "test-bucket") == 0) {
+        int idx = (argc >= 3) ? atoi(argv[2]) : 0;
+        return cmd_test_bucket(idx);
     }
 
     const char* model_path = argv[1];
@@ -455,19 +460,29 @@ int main(int argc, char** argv)
             int bias = (abs(offset) <= CENTER_DEAD_ZONE)
                        ? 0
                        : (int)(K_TURN * offset / (float)half_w);
-            int max_bias = (area_ratio >= AREA_BRAKE) ? MAX_TURN_BIAS_NEAR : MAX_TURN_BIAS_FAR;
-            bias = std::max(-max_bias, std::min(max_bias, bias));
 
-            // Ball on right (bias>0) → left wheel faster → turn right
-            int left_spd  = std::max(-100, std::min(100, spd + bias));
-            int right_spd = std::max(-100, std::min(100, spd - bias));
+            int left_spd, right_spd;
+            if (area_ratio >= 0.35) {
+                // 近距离：纯轴转，双轮反向，避免差速导致单轮反转丢球
+                int max_bias = MAX_TURN_BIAS_NEAR;
+                int pivot = std::max(-max_bias, std::min(max_bias, bias));
+                left_spd  = pivot;
+                right_spd = -pivot;
+            } else {
+                // 远距离：差速，双轮同向，保持前进同时修正方向
+                int max_bias = MAX_TURN_BIAS_FAR;
+                bias = std::max(-max_bias, std::min(max_bias, bias));
+                left_spd  = std::max(-100, std::min(100, spd + bias));
+                right_spd = std::max(-100, std::min(100, spd - bias));
+            }
 
             motor.drive(left_spd, right_spd);
 
             dup2(g_saved_stderr, STDERR_FILENO);
             long frame_us = elapsed_us(t_start);
-            printf("[STATE] CHASE zone=%-6s area=%.3f off=%3d bias=%3d  L=%3d R=%3d  fps=%.1f\n",
-                   zone, area_ratio, offset, bias, left_spd, right_spd, 1e6f / frame_us);
+            const char* steer = (area_ratio >= AREA_BRAKE) ? "pivot" : "diff";
+            printf("[STATE] CHASE zone=%-6s area=%.3f off=%3d steer=%-5s  L=%3d R=%3d  fps=%.1f\n",
+                   zone, area_ratio, offset, steer, left_spd, right_spd, 1e6f / frame_us);
             dup2(g_devnull, STDERR_FILENO);
 
         } else {
