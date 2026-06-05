@@ -679,3 +679,26 @@ int cmd_test_bucket(int uvc_index)
     capture.close();
     return 0;
 }
+
+// ── detect_bucket_frame: reusable helper for main loop ────────────────────────
+bool detect_bucket_frame(const uint8_t* rgb, int width, int height,
+                         BucketResult& out, int min_area)
+{
+    out.found = false;
+    float frame_area = (float)(width * height);
+    auto boxes = _find_red_boxes(rgb, width, height, min_area);
+    if (boxes.empty()) return false;
+
+    // pick largest
+    const BucketBox* best = &boxes[0];
+    for (const auto& b : boxes)
+        if (b.area > best->area) best = &b;
+
+    out.found      = true;
+    out.area_ratio = best->area / frame_area;
+    out.x = best->x; out.y = best->y;
+    out.w = best->w; out.h = best->h;
+    out.cx = best->x + best->w / 2;
+    out.cy = best->y + best->h / 2;
+    return true;
+}

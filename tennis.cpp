@@ -39,43 +39,66 @@ static const int MODEL_W      = 640;
 static const int MODEL_H      = 640;
 
 // ── Control parameters ────────────────────────────────────────────────────────
-// Smooth differential steering:
-//   left_speed  = base_speed + bias
-//   right_speed = base_speed - bias
-// bias = K_TURN * (offset / half_width), clamped to [-MAX_TURN_BIAS, MAX_TURN_BIAS]
-// offset>0 (ball on right) → bias>0 → left faster → turn right
-static const int   CHASE_SPEED_FAR  = 40;   // 语义速度(1~100)，Motor 层映射到实际PWM
-static const int   CHASE_SPEED_NEAR = 3;   // 接近时速度
+static const int   CHASE_SPEED_FAR  = 40;
+static const int   CHASE_SPEED_NEAR = 3;
 
 static const float AREA_FAR         = 0.02f;
 static const float AREA_NEAR        = 0.35f;
-static const float AREA_BRAKE       = 0.20f;  // 进入制动区（提前减速）
+static const float AREA_BRAKE       = 0.20f;
 
-static const int   BRAKE_SPEED      = 3;     // 制动区速度（语义）
-static const float AREA_STOP        = 0.28f;  // 触发停止
-static const float AREA_REVERSE     = 0.50f;  // 球太近 → 后退
-static const int   REVERSE_SPEED    = 15;     // 后退速度（语义）
+static const int   BRAKE_SPEED      = 3;
+static const float AREA_STOP        = 0.28f;
+static const float AREA_REVERSE     = 0.50f;
+static const int   REVERSE_SPEED    = 15;
 
-static const float AREA_STOP_EXIT   = 0.20f;  // 重新追球阈值
-static const int   STOP_CONFIRM_CNT = 4;      // 确认帧数
-static const int   BRAKE_PULSE_US   = 350000; // 持续制动 350ms
-static const int   STOP_CENTER_OFFSET = 90;   // px: 停止目标偏右（夹爪在右侧）
+static const float AREA_STOP_EXIT   = 0.20f;
+static const int   STOP_CONFIRM_CNT = 4;
+static const int   BRAKE_PULSE_US   = 350000;
+static const int   STOP_CENTER_OFFSET = 90;
 
 static const float K_TURN              = 25.0f;
-static const int   MAX_TURN_BIAS_FAR   = 5;     // 远距离差速偏置上限（语义）
-static const int   MAX_TURN_BIAS_NEAR  = 10;     // 近距离轴转上限（语义）
-static const int   CENTER_DEAD_ZONE    = 15;     // px: 追球死区
-static const int   STOP_CENTER_ZONE    = 5;     // px: 停止确认死区
-static const int   ALIGN_PIVOT_SPD     = 15;     // 对准轴转最大速度（语义）
-static const int   ALIGN_PIVOT_MIN     = 3;     // 对准轴转最小速度（语义，Motor层保证可动）
+static const int   MAX_TURN_BIAS_FAR   = 5;
+static const int   MAX_TURN_BIAS_NEAR  = 10;
+static const int   CENTER_DEAD_ZONE    = 15;
+static const int   STOP_CENTER_ZONE    = 5;
+static const int   ALIGN_PIVOT_SPD     = 15;
+static const int   ALIGN_PIVOT_MIN     = 3;
 
 static const int   SEARCH_FRAMES    = 25;
-static const int   SEARCH_PIVOT_SPD = 10;     // 查找轴转速度（语义）
+static const int   SEARCH_PIVOT_SPD = 10;
 
-static const int   ALIGN_STALL_FRAMES  = 20;    // 连续N帧偏移无变化 → 判定卡死
-static const int   ALIGN_STALL_MOVE_PX = 10;    // 变化小于此值视为未移动
-static const int   ALIGN_KICK_SPD      = 35;    // 卡死踢出速度（语义）
-static const int   ALIGN_KICK_US       = 180000;// 踢出持续时间 180ms
+static const int   ALIGN_STALL_FRAMES  = 20;
+static const int   ALIGN_STALL_MOVE_PX = 10;
+static const int   ALIGN_KICK_SPD      = 35;
+static const int   ALIGN_KICK_US       = 180000;
+
+// ── Bucket approach parameters ────────────────────────────────────────────────
+// 桶面积 > 此值时视为"足够近"可放球
+static const float BUCKET_AREA_DEPOSIT  = 0.90f;
+// 桶面积 > 此值时制动（避免撞桶）
+static const float BUCKET_AREA_BRAKE    = 0.70f;
+// 趋近桶时的前进速度
+static const int   BUCKET_APPROACH_SPD  = 25;
+// 趋近桶时的制动速度
+static const int   BUCKET_BRAKE_SPD     = 5;
+// 转向增益（与追球相同逻辑）
+static const float BUCKET_K_TURN        = 20.0f;
+static const int   BUCKET_MAX_BIAS      = 8;
+// 搜索桶时的旋转速度
+static const int   BUCKET_SEARCH_SPD    = 12;
+// 连续多少帧找不到桶 → 旋转搜索
+static const int   BUCKET_LOST_FRAMES   = 10;
+// 找到桶后确认帧数（防抖）
+static const int   BUCKET_CONFIRM_CNT   = 3;
+
+// ── Game state machine ────────────────────────────────────────────────────────
+enum class GameState {
+    CHASE_BALL,      // 追球，直到抓到
+    GRAB,            // 已到位，执行抓球动作（blocking，单次）
+    FIND_BUCKET,     // 旋转搜索红色桶
+    APPROACH_BUCKET, // 趋近桶
+    DEPOSIT,         // 放球（blocking，单次），完成后回到 CHASE_BALL
+};
 
 // ── Globals for signal handler ────────────────────────────────────────────────
 static Motor*              g_motor      = nullptr;
@@ -243,7 +266,9 @@ int main(int argc, char** argv)
     const size_t MJPEG_BUF = 1024 * 1024;
     uint8_t* mjpeg_buf = (uint8_t*)malloc(MJPEG_BUF);
     uint8_t* rgb_buf   = (uint8_t*)malloc(model_w * model_h * 3);
-    if (!mjpeg_buf || !rgb_buf) { LOGE("OOM"); return 1; }
+    // separate full-res buffer for bucket detection (HSV on 640×480)
+    uint8_t* bucket_rgb = (uint8_t*)malloc(FRAME_WIDTH * FRAME_HEIGHT * 3);
+    if (!mjpeg_buf || !rgb_buf || !bucket_rgb) { LOGE("OOM"); return 1; }
 
     dup2(g_saved_stderr, STDERR_FILENO);
     LOGI("Warming up camera (skip 20 frames)...");
@@ -259,16 +284,20 @@ int main(int argc, char** argv)
     int  last_seen_frame  = -999;
 
     // ── Stop state ────────────────────────────────────────────────────────────
-    bool stopped          = false;  // locked stop state
-    int  stop_confirm_cnt = 0;      // consecutive frames meeting stop condition
-    int  align_cnt        = 0;      // frames spent in ALIGN (timeout → force grab)
+    bool stopped          = false;
+    int  stop_confirm_cnt = 0;
+    int  align_cnt        = 0;
 
     // ── ALIGN stall detection ─────────────────────────────────────────────────
-    // 记录最近 ALIGN_STALL_FRAMES 帧的 offset，判断是否卡死
     static const int STALL_BUF = 30;
     int  align_off_buf[STALL_BUF] = {};
     int  align_off_head = 0;
-    bool align_kicking  = false;    // 正在执行踢出脉冲
+    bool align_kicking  = false;
+
+    // ── Game state ────────────────────────────────────────────────────────────
+    GameState game_state = GameState::CHASE_BALL;
+    int  bucket_lost_cnt  = 0;   // 连续找不到桶的帧数
+    int  bucket_confirm   = 0;   // 连续看到桶的帧数（防抖）
 
     // ── Chase loop ────────────────────────────────────────────────────────────
     while (true) {
@@ -297,6 +326,121 @@ int main(int argc, char** argv)
                          &lb_x, &lb_y, &lb_sc, &th, &td, &tc) != 0) continue;
         t_decode_acc += th + td + tc;
 
+        // ── 桶的状态机（FIND_BUCKET / APPROACH_BUCKET / DEPOSIT / DONE）────────
+        // 这几个状态不需要 YOLO，直接用 HSV 识别桶后跳过后续逻辑
+        if (game_state == GameState::FIND_BUCKET ||
+            game_state == GameState::APPROACH_BUCKET ||
+            game_state == GameState::DEPOSIT)
+        {
+            // 用全分辨率 bucket_rgb 做 HSV（decode_mjpeg 已解码到 model 尺寸的 rgb_buf，
+            // 这里重新以 FRAME 尺寸解码一次供桶检测用）
+            decode_mjpeg(mjpeg_buf, jpeg_len, bucket_rgb,
+                         FRAME_WIDTH, FRAME_HEIGHT, nullptr, nullptr, nullptr);
+
+            if (game_state == GameState::DEPOSIT) {
+                motor.standby();
+                dup2(g_saved_stderr, STDERR_FILENO);
+                printf("[GAME] DEPOSIT – releasing ball...\n");
+                dup2(g_devnull, STDERR_FILENO);
+                if (g_arm) g_arm->release();
+                usleep(500000);
+                if (g_arm) g_arm->grab_pos();
+                // ── 重置，继续找下一个球 ──────────────────────────────────
+                game_state       = GameState::CHASE_BALL;
+                stopped          = false;
+                stop_confirm_cnt = 0;
+                align_cnt        = 0;
+                align_off_head   = 0;
+                last_seen_frame  = -999;
+                bucket_lost_cnt  = 0;
+                bucket_confirm   = 0;
+                dup2(g_saved_stderr, STDERR_FILENO);
+                printf("[GAME] -> CHASE_BALL (next round)\n");
+                dup2(g_devnull, STDERR_FILENO);
+                continue;
+            }
+
+            // FIND_BUCKET / APPROACH_BUCKET: run HSV detection
+            BucketResult br;
+            bool bucket_visible = detect_bucket_frame(bucket_rgb,
+                                                      FRAME_WIDTH, FRAME_HEIGHT, br);
+
+            if (game_state == GameState::FIND_BUCKET) {
+                if (bucket_visible) {
+                    bucket_confirm++;
+                    bucket_lost_cnt = 0;
+                    if (bucket_confirm >= BUCKET_CONFIRM_CNT) {
+                        game_state = GameState::APPROACH_BUCKET;
+                        bucket_confirm = 0;
+                        dup2(g_saved_stderr, STDERR_FILENO);
+                        printf("[GAME] -> APPROACH_BUCKET  area=%.3f\n", br.area_ratio);
+                        dup2(g_devnull, STDERR_FILENO);
+                    } else {
+                        motor.standby(); // 稳住等确认
+                    }
+                } else {
+                    bucket_confirm = 0;
+                    bucket_lost_cnt++;
+                    // 旋转搜索（始终向右转，可根据场地调整）
+                    motor.drive(BUCKET_SEARCH_SPD, -BUCKET_SEARCH_SPD);
+                    dup2(g_saved_stderr, STDERR_FILENO);
+                    printf("[GAME] FIND_BUCKET searching... lost=%d\n", bucket_lost_cnt);
+                    dup2(g_devnull, STDERR_FILENO);
+                }
+                continue;
+            }
+
+            // APPROACH_BUCKET
+            if (!bucket_visible) {
+                bucket_lost_cnt++;
+                if (bucket_lost_cnt > BUCKET_LOST_FRAMES) {
+                    game_state = GameState::FIND_BUCKET;
+                    bucket_confirm = 0;
+                    dup2(g_saved_stderr, STDERR_FILENO);
+                    printf("[GAME] APPROACH_BUCKET lost bucket -> FIND_BUCKET\n");
+                    dup2(g_devnull, STDERR_FILENO);
+                } else {
+                    motor.standby(); // 短暂丢失时停车等
+                }
+                continue;
+            }
+            bucket_lost_cnt = 0;
+
+            if (br.area_ratio >= BUCKET_AREA_DEPOSIT) {
+                // 足够近 → 制动停车，进入放球
+                struct timeval tb2; gettimeofday(&tb2, nullptr);
+                while (elapsed_us(tb2) < BRAKE_PULSE_US) {
+                    motor.brake(); usleep(20000);
+                }
+                motor.standby();
+                game_state = GameState::DEPOSIT;
+                dup2(g_saved_stderr, STDERR_FILENO);
+                printf("[GAME] -> DEPOSIT  bucket area=%.3f\n", br.area_ratio);
+                dup2(g_devnull, STDERR_FILENO);
+                continue;
+            }
+
+            // 趋近：差速对准桶中心
+            int half_w2  = FRAME_WIDTH / 2;
+            int bk_off   = br.cx - half_w2;
+            int bk_bias  = (abs(bk_off) <= CENTER_DEAD_ZONE) ? 0
+                         : (int)(BUCKET_K_TURN * bk_off / (float)half_w2);
+            bk_bias = std::max(-BUCKET_MAX_BIAS, std::min(BUCKET_MAX_BIAS, bk_bias));
+
+            int bk_spd = (br.area_ratio >= BUCKET_AREA_BRAKE)
+                         ? BUCKET_BRAKE_SPD : BUCKET_APPROACH_SPD;
+            int bk_l = std::max(-100, std::min(100, bk_spd + bk_bias));
+            int bk_r = std::max(-100, std::min(100, bk_spd - bk_bias));
+            motor.drive(bk_l, bk_r);
+
+            dup2(g_saved_stderr, STDERR_FILENO);
+            printf("[GAME] APPROACH_BUCKET  area=%.3f off=%d  L=%d R=%d\n",
+                   br.area_ratio, bk_off, bk_l, bk_r);
+            dup2(g_devnull, STDERR_FILENO);
+            continue;
+        }
+
+        // ── 以下为 CHASE_BALL 逻辑（YOLO based）─────────────────────────────
         long ti=0, tr=0, to=0, tp=0;
         std::vector<detection> dets;
         detect_run(&rknn_ctx, rgb_buf, model_w, model_h,
@@ -396,6 +540,13 @@ int main(int argc, char** argv)
                     dup2(g_devnull, STDERR_FILENO);
                     // ── 执行抓球 ──────────────────────────────────────────────
                     if (g_arm) g_arm->grab();
+                    // ── 切换到找桶状态 ────────────────────────────────────────
+                    game_state    = GameState::FIND_BUCKET;
+                    bucket_lost_cnt = 0;
+                    bucket_confirm  = 0;
+                    dup2(g_saved_stderr, STDERR_FILENO);
+                    printf("[GAME] -> FIND_BUCKET\n");
+                    dup2(g_devnull, STDERR_FILENO);
                 } else {
                     motor.brake();
                 }
@@ -488,6 +639,7 @@ int main(int argc, char** argv)
         } else {
             int frames_lost = frame_idx - last_seen_frame;
             if (last_seen_frame >= 0 && frames_lost <= SEARCH_FRAMES) {
+                // 刚丢失：沿最后看到球的方向快速转
                 int pivot = (last_offset >= 0) ? SEARCH_PIVOT_SPD : -SEARCH_PIVOT_SPD;
                 motor.drive(pivot, -pivot);
                 dup2(g_saved_stderr, STDERR_FILENO);
@@ -495,9 +647,12 @@ int main(int argc, char** argv)
                        frames_lost, SEARCH_FRAMES, last_offset >= 0 ? "R" : "L");
                 dup2(g_devnull, STDERR_FILENO);
             } else {
-                motor.standby();
+                // 长时间丢失：原地慢速旋转扫描，方向每 60 帧反转一次
+                int scan_dir = ((frame_idx / 60) % 2 == 0) ? 1 : -1;
+                motor.drive(scan_dir * SEARCH_PIVOT_SPD, -scan_dir * SEARCH_PIVOT_SPD);
                 dup2(g_saved_stderr, STDERR_FILENO);
-                printf("[STATE] LOST   waiting...\n");
+                printf("[STATE] SCAN  frame=%d  dir=%s\n",
+                       frame_idx, scan_dir > 0 ? "R" : "L");
                 dup2(g_devnull, STDERR_FILENO);
             }
         }
@@ -507,6 +662,7 @@ int main(int argc, char** argv)
 
     free(mjpeg_buf);
     free(rgb_buf);
+    free(bucket_rgb);
     cleanup_and_exit();
     return 0;
 }
